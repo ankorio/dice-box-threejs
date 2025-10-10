@@ -988,7 +988,8 @@ class DiceBox {
 	async reroll(diceIdArray) {
 		this.rolling = true;
 		this.running = Date.now();
-		this.iteration = 0
+		this.iteration = 0;
+		this.last_time = 0; // fix the animation: starts from the beginning 
 		return new Promise((resolve,reject) => {
 			diceIdArray.forEach(dieId => {
 				const dicemesh = this.diceList[dieId]
@@ -1144,5 +1145,6 @@ class DiceBox {
 
 	}
 }
+
 
 export { DiceBox }
