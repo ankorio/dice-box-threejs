@@ -11,6 +11,29 @@ Teall dice had already solved predeterministic rolling, which is a feature some 
 ## Demo
 https://codesandbox.io/s/dice-box-threejs-j79h35?file=/src/index.js
 
+## Run the local demo
+```bash
+npm install
+npm run demo
+```
+
+Then open `http://127.0.0.1:8080/`
+
+If port `8080` is busy, use another one:
+```bash
+npm run demo -- --port 8081
+```
+
+If you change files under `src`, rebuild the bundle first:
+```bash
+npm run build
+```
+
+If you're using PowerShell on Windows and `npm` is blocked by execution policy, use:
+```powershell
+npm.cmd run demo
+```
+
 ## Install using NPM
 ```
 npm install @3d-dice/dice-box-threejs

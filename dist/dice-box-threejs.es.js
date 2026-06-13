@@ -5652,7 +5652,7 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 			let e = Date.now();
 			this._lastStepTime ||= e - this.framerate * 1e3;
 			let t = (e - this._lastStepTime) / 1e3;
-			t > .1 && (t = .1);
+			t > .5 && (t = .5);
 			let n = Math.max(1, Math.floor(t / this.framerate));
 			this.animstate = "throw";
 			for (let e = 0; e < n; e++) this.world.step(this.framerate);
@@ -5662,6 +5662,7 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 				t.body != null && (t.position.copy(t.body.position), t.quaternion.copy(t.body.quaternion));
 			}
 			for (let e of this.groups.values()) e.state === "animating" && (e.iteration += n, this.groupFinished(e) && this.finalizeGroup(e));
+			this.renderer && (this.renderer.shadowMap.needsUpdate = !0);
 		} else this._lastStepTime = Date.now();
 		this.render();
 	}
@@ -5682,7 +5683,7 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 		this.renderer = new e.WebGLRenderer({
 			antialias: !0,
 			alpha: !0
-		}), this.container.appendChild(this.renderer.domElement), this.renderer.shadowMap.enabled = this.shadows, this.renderer.shadowMap.type = e.PCFSoftShadowMap, this.renderer.setClearColor(0, 0), this.setDimensions(this.dimensions), this.world.gravity.set(0, 0, -9.8 * this.gravity_multiplier), this.world.broadphase = new ve(), this.world.solver.iterations = 14, this.world.allowSleep = !0, this.makeWorldBox(), this.resizeWorld(), await this.loadTheme({
+		}), this.container.appendChild(this.renderer.domElement), this.renderer.shadowMap.enabled = this.shadows, this.renderer.shadowMap.type = e.VSMShadowMap, this.renderer.shadowMap.autoUpdate = !1, this.renderer.shadowMap.needsUpdate = !0, this.renderer.setClearColor(0, 0), this.setDimensions(this.dimensions), this.world.gravity.set(0, 0, -9.8 * this.gravity_multiplier), this.world.broadphase = new ve(), this.world.solver.iterations = 14, this.world.allowSleep = !0, this.makeWorldBox(), this.resizeWorld(), await this.loadTheme({
 			colorset: this.theme_colorset,
 			texture: this.theme_texture,
 			material: this.theme_material
@@ -5824,9 +5825,9 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 		let n = Math.max(this.display.containerWidth, this.display.containerHeight);
 		this.light && this.scene.remove(this.light), this.light_amb && this.scene.remove(this.light_amb);
 		let r = Math.PI;
-		this.light = new e.SpotLight(this.color_spotlight, this.light_intensity * r), this.light.position.set(-n / 2, n / 2, n * 3), this.light.target.position.set(0, 0, 0), this.light.distance = n * 5, this.light.decay = 0, this.light.angle = Math.PI / 4, this.light.castShadow = this.shadows, this.light.shadow.camera.near = n / 10, this.light.shadow.camera.far = n * 5, this.light.shadow.camera.fov = 50, this.light.shadow.bias = .001, this.light.shadow.mapSize.width = 1024, this.light.shadow.mapSize.height = 1024, this.scene.add(this.light), this.light_amb = new e.HemisphereLight(16777147, 6776689, this.light_intensity * r), this.scene.add(this.light_amb), this.desk && this.scene.remove(this.desk);
+		this.light = new e.SpotLight(this.color_spotlight, this.light_intensity * r), this.light.position.set(-n / 2, n / 2, n * 3), this.light.target.position.set(0, 0, 0), this.light.distance = n * 5, this.light.decay = 0, this.light.angle = Math.PI / 4, this.light.castShadow = this.shadows, this.light.shadow.camera.near = n / 10, this.light.shadow.camera.far = n * 5, this.light.shadow.camera.fov = 50, this.light.shadow.bias = -5e-4, this.light.shadow.mapSize.width = 2048, this.light.shadow.mapSize.height = 2048, this.light.shadow.radius = 6, this.light.shadow.blurSamples = 16, this.scene.add(this.light), this.renderer && (this.renderer.shadowMap.needsUpdate = !0), this.light_amb = new e.HemisphereLight(16777147, 6776689, this.light_intensity * r), this.scene.add(this.light_amb), this.desk && this.scene.remove(this.desk);
 		let i = new e.ShadowMaterial();
-		i.opacity = .5, this.desk = new e.Mesh(new e.PlaneGeometry(this.display.containerWidth * 6, this.display.containerHeight * 6, 1, 1), i), this.desk.receiveShadow = this.shadows, this.scene.add(this.desk), this.renderer.render(this.scene, this.camera);
+		i.opacity = .6, this.desk = new e.Mesh(new e.PlaneGeometry(this.display.containerWidth * 6, this.display.containerHeight * 6, 1, 1), i), this.desk.receiveShadow = this.shadows, this.scene.add(this.desk), this.renderer && (this.renderer.shadowMap.needsUpdate = !0), this.renderer.render(this.scene, this.camera);
 	}
 	resizeWorld() {
 		let t = dr(() => {
@@ -6058,8 +6059,8 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 		this.running = !1;
 		let e;
 		for (; e = this.diceList.pop();) this.scene.remove(e), e.body && this.world.removeBody(e.body);
-		this.renderer.render(this.scene, this.camera), setTimeout(() => {
-			this.renderer.render(this.scene, this.camera);
+		this.renderer.shadowMap.needsUpdate = !0, this.renderer.render(this.scene, this.camera), setTimeout(() => {
+			this.renderer.shadowMap.needsUpdate = !0, this.renderer.render(this.scene, this.camera);
 		}, 100);
 	}
 	clearAllGroups() {
@@ -6158,7 +6159,7 @@ var Jn = { type: "postStep" }, Yn = { type: "preStep" }, K = {
 		for (let e of t.meshes) e.body && this.world.removeBody(e.body), this.scene.remove(e), e.storeRolledValue("remove"), n.push(this.singleDieResult(e));
 		t.state = "removed";
 		let r = new Set(t.meshes);
-		return this.diceList = this.diceList.filter((e) => !r.has(e)), this.groups.delete(e), this.onRemoveDiceComplete(n), document.dispatchEvent(new CustomEvent("removeGroupComplete", { detail: {
+		return this.diceList = this.diceList.filter((e) => !r.has(e)), this.groups.delete(e), this.renderer && (this.renderer.shadowMap.needsUpdate = !0), this.onRemoveDiceComplete(n), document.dispatchEvent(new CustomEvent("removeGroupComplete", { detail: {
 			groupId: e,
 			results: n
 		} })), n;
