@@ -27,6 +27,7 @@ const defaultConfig = {
 	baseScale: 100,
 	strength: 1,
 	iterationLimit: 1000,
+	continuousRender: false,
 	onRollComplete: () => {},
 	onRerollComplete: () => {},
 	onAddDiceComplete: () => {},
@@ -84,6 +85,15 @@ class DiceBox {
 		this.notationVectors = null
 		this.dieIndex = 0
 
+		// VFX integration hooks (additive, backward-compatible).
+		// External particle systems register per-frame callbacks here; the
+		// continuous loop keeps drawing while dice are idle (looping auras).
+		this._beforeRenderCallbacks = [];
+		this._afterRenderCallbacks = [];
+		this._lastRenderTime = 0;
+		this._continuousRunning = false;
+		this._continuousRAF = null;
+
 		//public variables
 		// this.framerate = (1/60);
 		// this.sounds = false;
@@ -137,6 +147,81 @@ class DiceBox {
 		if (this.desk) this.desk.receiveShadow = this.shadows;
 	}
 
+	// --- VFX integration hooks (additive, upstreamable) ---
+
+	// Register a callback invoked each rendered frame, before the draw call,
+	// with a delta-time in seconds. Returns an unsubscribe function.
+	onBeforeRender(cb) {
+		if (typeof cb === 'function' && !this._beforeRenderCallbacks.includes(cb)) {
+			this._beforeRenderCallbacks.push(cb);
+		}
+		return () => this.offBeforeRender(cb);
+	}
+
+	offBeforeRender(cb) {
+		const i = this._beforeRenderCallbacks.indexOf(cb);
+		if (i !== -1) this._beforeRenderCallbacks.splice(i, 1);
+	}
+
+	// Register a callback invoked each rendered frame, after the draw call.
+	// Returns an unsubscribe function.
+	onAfterRender(cb) {
+		if (typeof cb === 'function' && !this._afterRenderCallbacks.includes(cb)) {
+			this._afterRenderCallbacks.push(cb);
+		}
+		return () => this.offAfterRender(cb);
+	}
+
+	offAfterRender(cb) {
+		const i = this._afterRenderCallbacks.indexOf(cb);
+		if (i !== -1) this._afterRenderCallbacks.splice(i, 1);
+	}
+
+	// Draw one frame, firing before/after callbacks with a delta-time (seconds)
+	// so external particle systems can advance their lifecycles. With no
+	// callbacks registered this is equivalent to the old renderer.render() call.
+	render() {
+		const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+		let dt = this._lastRenderTime ? (now - this._lastRenderTime) / 1000 : 0;
+		this._lastRenderTime = now;
+		// clamp after long idle gaps (first frame, tab hidden, between rolls)
+		if (dt > 0.1) dt = 0.1;
+
+		for (let i = 0; i < this._beforeRenderCallbacks.length; i++) {
+			this._beforeRenderCallbacks[i](dt);
+		}
+
+		this.renderer.render(this.scene, this.camera);
+
+		for (let i = 0; i < this._afterRenderCallbacks.length; i++) {
+			this._afterRenderCallbacks[i](dt);
+		}
+	}
+
+	// Continuous render loop — keeps drawing while dice are idle so looping
+	// effects (auras) and any particle that outlives the throw keep animating.
+	// The throw animation drives its own renders, so we skip rendering here
+	// while a roll is in flight to avoid double-draws.
+	start() {
+		if (this._continuousRunning) return;
+		this._continuousRunning = true;
+		this._lastRenderTime = 0;
+		const loop = () => {
+			if (!this._continuousRunning) return;
+			if (!this.rolling) this.render();
+			this._continuousRAF = requestAnimationFrame(loop);
+		};
+		this._continuousRAF = requestAnimationFrame(loop);
+	}
+
+	stop() {
+		this._continuousRunning = false;
+		if (this._continuousRAF != null) {
+			cancelAnimationFrame(this._continuousRAF);
+			this._continuousRAF = null;
+		}
+	}
+
 	async initialize() {
 
 		// this.cannonDebugger = new CannonDebugger(this.scene,this.world)
@@ -176,6 +261,8 @@ class DiceBox {
 		this.initialized = true
 
 		this.renderer.render(this.scene, this.camera);
+
+		if (this.continuousRender) this.start();
 	}
 
 	makeWorldBox(){
@@ -840,7 +927,7 @@ class DiceBox {
 			}
 		}
 
-		this.renderer.render(this.scene, this.camera);
+		this.render();
 		this.last_time = this.last_time + neededSteps*this.framerate*1000;
 
 
@@ -875,7 +962,7 @@ class DiceBox {
 
 		this.running = false;
 		this.last_time = time;
-		this.renderer.render(this.scene, this.camera);
+		this.render();
 		if (this.running == threadid) {
 			((animateCallback, tid, at) => {
 				if (!at && time_diff < this.framerate) {
