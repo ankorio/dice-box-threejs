@@ -442,10 +442,16 @@ class DiceBox {
 
 		if (this.light) this.scene.remove(this.light);
 		if (this.light_amb) this.scene.remove(this.light_amb);
-		this.light = new THREE.SpotLight(this.color_spotlight, this.light_intensity);
+		// three r155+ made lights physically-correct and removed useLegacyLights
+		// (r165). Scale by PI to restore the pre-r155 brightness these intensities
+		// were tuned for, and disable the SpotLight's (now default) inverse-square
+		// decay, which would otherwise drop to ~0 over these world distances.
+		const lightScale = Math.PI;
+		this.light = new THREE.SpotLight(this.color_spotlight, this.light_intensity * lightScale);
 		this.light.position.set(-maxwidth / 2, maxwidth / 2, maxwidth * 3);
 		this.light.target.position.set(0, 0, 0);
 		this.light.distance = maxwidth * 5;
+		this.light.decay = 0;
 		this.light.angle = Math.PI/4;
 		this.light.castShadow = this.shadows;
 		this.light.shadow.camera.near = maxwidth / 10;
@@ -456,7 +462,7 @@ class DiceBox {
 		this.light.shadow.mapSize.height = 1024;
 		this.scene.add(this.light);
 
-		this.light_amb = new THREE.HemisphereLight( 0xffffbb, 0x676771, this.light_intensity );
+		this.light_amb = new THREE.HemisphereLight( 0xffffbb, 0x676771, this.light_intensity * lightScale );
 		this.scene.add(this.light_amb);
 
 		if (this.desk) this.scene.remove(this.desk);
