@@ -15,5 +15,13 @@ export default defineConfig({
     },
     outDir,
     emptyOutDir: true,
+    rollupOptions: {
+      // Share a single three instance with the host app (peerDependency).
+      // cannon-es stays bundled — physics needs no sharing.
+      external: ['three'],
+      output: {
+        globals: { three: 'THREE' }
+      }
+    }
   }
 })
