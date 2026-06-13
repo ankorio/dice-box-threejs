@@ -58,34 +58,44 @@ export class DiceColors {
 	// }
 	
 	async getColorSet(options) {
-		let setName, texture
+		let setName, texture, material
 		if(typeof options === "string") {
 			setName = options
 		}
 		if(typeof options === "object") {
 			setName = options.colorset
-		}
-		// if colorset has already been created and cached, then return it
-		if(this.colorsets.hasOwnProperty(setName)) {
-			return this.colorsets[setName]
+			texture = options.texture
+			material = options.material
 		}
 
-		let colorset = COLORSETS[setName];
-		texture = options.texture || colorset.texture
-		
-		// get texture data
-		colorset.texture = this.getTexture(texture)
+		const base = COLORSETS[setName] || COLORSETS["white"]
+		texture = texture || base.texture
 
-		// load textures
-		colorset.texture = await this.ImageLoader(colorset.texture)
+		// Cache by colorset + texture + material, not just the colorset name — the
+		// same palette (e.g. "white") is used with many different textures/materials
+		// across concurrent rolls, and keying by name alone returned the wrong look.
+		const texKey = Array.isArray(texture) ? texture.join(',') : texture
+		const cacheKey = `${setName}|${texKey}|${material || ''}`
+		if(this.colorsets.hasOwnProperty(cacheKey)) {
+			return this.colorsets[cacheKey]
+		}
 
-		// if material type was specified then use it
-		if(options.material) {
-			colorset.texture.material = options.material
+		// Clone so we never mutate the shared COLORSETS entry (it would corrupt every
+		// other roll that reuses this palette with a different texture/material).
+		let colorset = Object.assign({}, base)
+
+		// get texture data + load images
+		colorset.texture = await this.ImageLoader(this.getTexture(texture))
+
+		// if material type was specified then use it (clone the texture object first so
+		// the override doesn't leak onto the shared TEXTURELIST entry)
+		if(material && !Array.isArray(colorset.texture)) {
+			colorset.texture = Object.assign({}, colorset.texture)
+			colorset.texture.material = material
 		}
 
 		// save it for later
-		this.colorsets[setName] = colorset
+		this.colorsets[cacheKey] = colorset
 
 		return colorset;
 	}
@@ -103,7 +113,9 @@ export class DiceColors {
 		// load textures
 		colorset.texture = await this.ImageLoader(texture)
 
-		if(options.material) {
+		if(options.material && !Array.isArray(colorset.texture)) {
+			// clone first so the material override doesn't leak onto the shared TEXTURELIST entry
+			colorset.texture = Object.assign({}, colorset.texture)
 			colorset.texture.material = options.material
 		}
 

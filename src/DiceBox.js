@@ -85,6 +85,13 @@ class DiceBox {
 		this.notationVectors = null
 		this.dieIndex = 0
 
+		// Concurrent roll groups. Each independent throw (keyed by an app-supplied
+		// groupId) coexists in the same scene/physics world with its own dice, theme,
+		// entry side, settle detection and completion promise. See rollGroup().
+		this.groups = new Map()
+		this._addCounter = 0
+		this._lastStepTime = 0
+
 		// VFX integration hooks (additive, backward-compatible).
 		// External particle systems register per-frame callbacks here; the
 		// continuous loop keeps drawing while dice are idle (looping auras).
@@ -198,17 +205,19 @@ class DiceBox {
 		}
 	}
 
-	// Continuous render loop — keeps drawing while dice are idle so looping
-	// effects (auras) and any particle that outlives the throw keep animating.
-	// The throw animation drives its own renders, so we skip rendering here
-	// while a roll is in flight to avoid double-draws.
+	// The single persistent loop. It owns physics stepping AND rendering for the
+	// whole box: every frame it advances the shared world (only while some group is
+	// animating), syncs meshes to their bodies, runs per-group settle detection, and
+	// renders once (so VFX onBeforeRender callbacks keep firing even when idle).
+	// This replaces the old per-roll animateThrow loop + its this.running thread-id.
 	start() {
 		if (this._continuousRunning) return;
 		this._continuousRunning = true;
 		this._lastRenderTime = 0;
+		this._lastStepTime = 0;
 		const loop = () => {
 			if (!this._continuousRunning) return;
-			if (!this.rolling) this.render();
+			this.stepAndRender();
 			this._continuousRAF = requestAnimationFrame(loop);
 		};
 		this._continuousRAF = requestAnimationFrame(loop);
@@ -220,6 +229,65 @@ class DiceBox {
 			cancelAnimationFrame(this._continuousRAF);
 			this._continuousRAF = null;
 		}
+	}
+
+	hasAnimatingGroup() {
+		for (const group of this.groups.values()) {
+			if (group.state === 'animating') return true;
+		}
+		return false;
+	}
+
+	stepAndRender() {
+		const animating = this.hasAnimatingGroup();
+		this.rolling = animating;
+
+		if (animating) {
+			const time = Date.now();
+			if (!this._lastStepTime) this._lastStepTime = time - (this.framerate * 1000);
+			let time_diff = (time - this._lastStepTime) / 1000;
+			// clamp after long idle gaps so a freshly-started group doesn't fast-forward
+			if (time_diff > 0.1) time_diff = 0.1;
+			const neededSteps = Math.max(1, Math.floor(time_diff / this.framerate));
+
+			this.animstate = 'throw';
+			for (let i = 0; i < neededSteps; i++) {
+				this.world.step(this.framerate);
+			}
+			this._lastStepTime = this._lastStepTime + neededSteps * this.framerate * 1000;
+
+			// sync every body-bearing scene child to its physics body
+			for (let i in this.scene.children) {
+				let interact = this.scene.children[i];
+				if (interact.body != undefined) {
+					interact.position.copy(interact.body.position);
+					interact.quaternion.copy(interact.body.quaternion);
+				}
+			}
+
+			// per-group settle detection — scoped to each group's own dice
+			for (const group of this.groups.values()) {
+				if (group.state !== 'animating') continue;
+				group.iteration += neededSteps;
+				if (this.groupFinished(group)) this.finalizeGroup(group);
+			}
+		} else {
+			// idle: keep the step clock current so the next group starts cleanly
+			this._lastStepTime = Date.now();
+		}
+
+		this.render();
+	}
+
+	finalizeGroup(group) {
+		if (group.state !== 'animating') return;
+		group.state = 'settled';
+		group.settled = true;
+		const results = this.buildResults(group.notationVectors, group.meshes);
+		const waiters = group.waiters;
+		group.waiters = [];
+		for (const resolve of waiters) { try { resolve(results); } catch (e) {} }
+		document.dispatchEvent(new CustomEvent('groupComplete', { detail: { groupId: group.groupId, results } }));
 	}
 
 	async initialize() {
@@ -262,7 +330,9 @@ class DiceBox {
 
 		this.renderer.render(this.scene, this.camera);
 
-		if (this.continuousRender) this.start();
+		// The persistent loop is now the sole owner of stepping + rendering, so it
+		// must always run (it drives both dice physics and idle VFX render frames).
+		this.start();
 	}
 
 	makeWorldBox(){
@@ -306,14 +376,38 @@ class DiceBox {
 	}
 
 	async loadTheme(themeConfig){
-		let colorData
-		if(this.theme_customColorset){
-			colorData = await this.DiceColors.makeColorSet(this.theme_customColorset)
-		} else {
-			colorData = await this.DiceColors.getColorSet(themeConfig)
-		}
+		const colorData = await this.resolveColorData(themeConfig && themeConfig.customColorset
+			? { customColorset: themeConfig.customColorset }
+			: themeConfig)
 		this.DiceFactory.applyColorSet(colorData)
 		this.colorData = colorData
+	}
+
+	// Resolve a theme description to a colorData object WITHOUT mutating global
+	// factory/box state — used per group so concurrent rolls keep distinct looks.
+	// theme: { colorset?, texture?, material?, customColorset? }; missing fields
+	// fall back to the box's configured defaults.
+	async resolveColorData(theme = {}){
+		if (theme && (theme.customColorset || this.theme_customColorset && theme.useGlobalCustom)) {
+			return await this.DiceColors.makeColorSet(theme.customColorset || this.theme_customColorset)
+		}
+		return await this.DiceColors.getColorSet({
+			colorset: theme.colorset || this.theme_colorset,
+			texture: theme.texture != null ? theme.texture : this.theme_texture,
+			material: theme.material || this.theme_material,
+		})
+	}
+
+	// The box's current global theme as a theme description (used by the legacy
+	// roll()/add() wrappers, which carry no per-group theme of their own).
+	currentTheme(){
+		if (this.theme_customColorset) return { customColorset: this.theme_customColorset }
+		return { colorset: this.theme_colorset, texture: this.theme_texture, material: this.theme_material }
+	}
+
+	randomSide(){
+		const sides = ['left', 'right', 'top', 'bottom']
+		return sides[Math.floor(Math.random() * sides.length)]
 	}
 
 	async loadSounds(){
@@ -718,17 +812,22 @@ class DiceBox {
 	}
 
 	//spawns one dicemesh object from a single vectordata object
-	spawnDice(vectordata, reset = false) {
+	spawnDice(vectordata, reset = false, group = null) {
 		const {pos, axis, angle, velocity} = vectordata
 		let dicemesh
-		
+
 		if(!reset) {
-			dicemesh = this.DiceFactory.create(vectordata.type, this.colorData);
+			// The factory bakes materials from its current colorset state (set via
+			// applyColorSet just before this group's spawn loop), so each group's
+			// dice freeze their own look at creation time.
+			dicemesh = this.DiceFactory.create(vectordata.type);
 			if(!dicemesh) return;
 			dicemesh.notation = vectordata;
 			dicemesh.result = [];
 			dicemesh.stopped = 0;
 			dicemesh.castShadow = this.shadows;
+			dicemesh.groupId = group ? group.groupId : undefined;
+			dicemesh._group = group;
 			this.scene.add(dicemesh);
 			this.diceList.push(dicemesh);
 		} else {
@@ -851,13 +950,15 @@ class DiceBox {
 		return reroll;
 	}
 
-	throwFinished() {
-		const forcedFinish = this.iteration > this.iterationLimit
+	// Group-scoped settle detection — a clone of the old throwFinished() that
+	// iterates ONLY this group's dice, so one group settling never touches another.
+	groupFinished(group) {
+		const forcedFinish = group.iteration > this.iterationLimit
+		const sleepState = CANNON.Body.SLEEPING
 
-		// cycle through diceList and if any dice are still awake then return false
-		for (let i=0, len=this.diceList.length; i < len; ++i) {
-			const dicemesh = this.diceList[i];
-			const sleepState = CANNON.Body.SLEEPING
+		for (let i = 0, len = group.meshes.length; i < len; ++i) {
+			const dicemesh = group.meshes[i];
+			if (!dicemesh || !dicemesh.body) continue; // removed mid-flight
 
 			if (dicemesh.body.sleepState < sleepState && !forcedFinish) {
 				return false;
@@ -892,120 +993,83 @@ class DiceBox {
 
 				dicemesh.rerolling = false;
 				dicemesh.body.type = CANNON.Body.KINEMATIC;
-				
 			}
 		}
 		return true;
 	}
 
-	simulateThrow() {
+	// Pre-simulate one group to its resting position so forced results can be
+	// face-swapped BEFORE the visible throw (avoiding any settle-time "number flip").
+	// Other groups' bodies are lifted out of the world for the duration so this
+	// blocking sim can't fast-forward dice that are still in flight; their state is
+	// untouched and they're added straight back.
+	simulateGroup(group) {
+		const prevAnimstate = this.animstate;
 		this.animstate = 'simulate';
-		this.iteration = 0;
-		this.rolling = true;
-		while (!this.throwFinished(true)) {
-			++this.iteration;
+
+		const removed = [];
+		for (let i = 0, len = this.diceList.length; i < len; ++i) {
+			const mesh = this.diceList[i];
+			if (!mesh || !mesh.body) continue;
+			if (mesh._group === group) continue;
+			this.world.removeBody(mesh.body);
+			removed.push(mesh.body);
+		}
+
+		group.iteration = 0;
+		while (!this.groupFinished(group)) {
+			++group.iteration;
 			this.world.step(this.framerate);
 		}
+
+		for (let i = 0; i < removed.length; i++) this.world.addBody(removed[i]);
+		this.animstate = prevAnimstate;
 	}
 
-	animateThrow(threadid, callback){
-		this.animstate = 'throw';
-		let time = Date.now();
-		this.last_time = this.last_time || time - (this.framerate*1000);
-		let time_diff = (time - this.last_time) / 1000;
-		++this.iteration;
-		let neededSteps = Math.floor(time_diff / this.framerate);
-
-		// this.container.style.opacity = '1';
-
-		for(let i = 0; i < neededSteps; i++) {
-			this.world.step(this.framerate);
-			// this.cannonDebugger.update()
-			++this.steps;
-		}
-
-		// update physics interactions visually
-		for (let i in this.scene.children) {
-			let interact = this.scene.children[i];
-			if (interact.body != undefined) {
-				interact.position.copy(interact.body.position);
-				interact.quaternion.copy(interact.body.quaternion);
+	startClickThrow(notation, side) {
+		let vector;
+		const W = this.display.currentWidth;
+		const H = this.display.currentHeight;
+		if (side) {
+			// Bias the throw direction so the dice enter from the chosen edge. The
+			// sign of the velocity vector decides the spawn edge in getNotationVectors
+			// (pos is placed opposite the velocity); the perpendicular axis keeps a
+			// little jitter so multiple dice from one player still spread naturally.
+			const jitter = (mag) => (Math.random() * 2 - 1) * mag * 0.5;
+			switch (side) {
+				case 'left':   vector = { x:  W, y: jitter(H) }; break;
+				case 'right':  vector = { x: -W, y: jitter(H) }; break;
+				case 'top':    vector = { x: jitter(W), y: -H }; break;
+				case 'bottom': vector = { x: jitter(W), y:  H }; break;
+				default:       vector = { x: (Math.random() * 2 - 0.5) * W, y: -(Math.random() * 2 - 0.5) * H };
 			}
+		} else {
+			vector = { x: (Math.random() * 2 - 0.5) * W, y: -(Math.random() * 2 - 0.5) * H };
 		}
 
-		this.render();
-		this.last_time = this.last_time + neededSteps*this.framerate*1000;
-
-
-		// roll finished
-		if (this.running == threadid && this.throwFinished()) {
-			this.running = false;
-			this.rolling = false;
-			if(callback) callback.call(this, this.notationVectors);
-			
-			this.running = Date.now();
-			this.animateAfterThrow(this.running);
-			return;
-		}
-
-		// roll not finished, keep animating
-		if (this.running == threadid) {
-			((animateCallback, tid, at, aftercall, vecs) => {
-				if (!at && time_diff < this.framerate) {
-					setTimeout(() => { requestAnimationFrame(() => { animateCallback.call(this, tid, aftercall, vecs); }) }, (this.framerate - time_diff) * 1000);
-				} else {
-					requestAnimationFrame(() => { animateCallback.call(this, tid, aftercall, vecs); });
-				}
-			}).bind(this)(this.animateThrow, threadid, this.adaptive_timestep, callback);
-		}
-	}
-
-	animateAfterThrow(threadid) {
-		this.animstate = 'afterthrow';
-		let time = Date.now();
-		let time_diff = (time - this.last_time) / 1000;
-		if (time_diff > 3) time_diff = this.framerate;
-
-		this.running = false;
-		this.last_time = time;
-		this.render();
-		if (this.running == threadid) {
-			((animateCallback, tid, at) => {
-				if (!at && time_diff < this.framerate) {
-					setTimeout(() => { requestAnimationFrame(() => { animateCallback.call(this, tid); }) }, (this.framerate - time_diff) * 1000);
-				} else {
-					requestAnimationFrame(() => { animateCallback.call(this, tid); });
-				}
-			}).bind(this)(this.animateAfterThrow, threadid, this.adaptive_timestep);
-		}
-	}
-
-	startClickThrow(notation) {
-		// if (this.rolling) return;
-		if(this.rolling) {
-			this.clearDice();
-			this.rolling = false
-		}
-
-		let vector = { x: (Math.random() * 2 - 0.5) * this.display.currentWidth, y: -(Math.random() * 2 - 0.5) * this.display.currentHeight };
 		let dist = Math.sqrt(vector.x * vector.x + vector.y * vector.y) + 100;
 		let boost = (Math.random() + 3) * dist * this.strength;
 
-		const notationVectors = this.getNotationVectors(notation, vector, boost, dist);
-
-		return notationVectors
+		return this.getNotationVectors(notation, vector, boost, dist);
 	}
 
 	clearDice() {
 		this.running = false;
 		let dice;
 		while (dice = this.diceList.pop()) {
-			this.scene.remove(dice); 
+			this.scene.remove(dice);
 			if (dice.body) this.world.removeBody(dice.body);
 		}
 		this.renderer.render(this.scene, this.camera);
 
 		setTimeout(() => { this.renderer.render(this.scene, this.camera); }, 100);
+	}
+
+	// Remove every die AND every group record. Used by the legacy roll() path
+	// (which still has "a new roll wipes the previous one" semantics).
+	clearAllGroups() {
+		this.clearDice();
+		this.groups.clear();
 	}
 
 	getDiceResults(id){
@@ -1017,17 +1081,24 @@ class DiceBox {
 				...this.diceList[id].result.at(-1)
 			}
 		}
+		return this.buildResults(this.notationVectors, this.diceList)
+	}
+
+	// Build the roll-result object for a notation + its ordered list of dice meshes.
+	// Works for the whole box (this.notationVectors + this.diceList) or for a single
+	// group (group.notationVectors + group.meshes), since each list is in set order.
+	buildResults(notationVectors, meshes){
 		let counter = 0
-		const modifier = this.notationVectors.constant ? parseInt(`${this.notationVectors.op}${this.notationVectors.constant}`) : 0
+		const modifier = notationVectors.constant ? parseInt(`${notationVectors.op}${notationVectors.constant}`) : 0
 		let rollTotal = modifier
 		const result = {
-			notation: this.notationVectors.notation,
-			sets: this.notationVectors.set.map(set => {
+			notation: notationVectors.notation,
+			sets: notationVectors.set.map(set => {
 				const endCount = counter + set.num - 1
 				let setTotal = 0
 				const rolls = []
 				for (let index = counter; index <= endCount; index++) {
-					if(this.diceList[counter].result.at(-1).reason === "remove") {
+					if(meshes[counter].result.at(-1).reason === "remove") {
 						counter++
 						continue
 					}
@@ -1035,9 +1106,9 @@ class DiceBox {
 						type: set.type,
 						sides: parseInt(set.type.substring(1)),
 						id: counter,
-						...this.diceList[counter].result.at(-1)
+						...meshes[counter].result.at(-1)
 					})
-					setTotal += this.diceList[counter].result.at(-1).value
+					setTotal += meshes[counter].result.at(-1).value
 					counter++
 				}
 				const returnSet = {
@@ -1056,194 +1127,177 @@ class DiceBox {
 		return result
 	}
 
-	async roll(notationSting){
-		this.notationVectors = this.startClickThrow(notationSting)
-		if(this.notationVectors){
-			// const DL = this.diceList
-			return new Promise((resolve,reject) => {
-				this.rollDice(() => {
-					const results = this.getDiceResults()
-	
-					// setting up a couple of ways to consume the final results
-					// call onRollComplete 
-					this.onRollComplete(results)
-	
-					// dispatch an event with the results object for other UI elements to listen for
-					const event = new CustomEvent('rollComplete', {detail: results})
-					document.dispatchEvent(event)
-	
-					resolve(results)
-				})
-			})
+	// Per-group result for a single removed die (mirrors getDiceResults(id)).
+	singleDieResult(mesh){
+		return {
+			type: mesh.shape,
+			sides: parseInt(mesh.shape.substring(1)),
+			...mesh.result.at(-1)
 		}
 	}
 
-	async reroll(diceIdArray) {
+	// --- Concurrent group API (the core of multi-roll support) ---
+
+	// Spawn one independent roll group into the shared scene. Each group keeps its
+	// own dice, theme (texture/material/colorset), entry side and settle lifecycle,
+	// and resolves when ONLY this group's dice come to rest. Multiple groups can be
+	// in flight at once, started at any time, each removed independently.
+	//   groupId : app-supplied id (defaults to an auto id)
+	//   notation: dice notation, e.g. "2d20@13,8" (forced results supported)
+	//   theme   : { colorset?, texture?, material?, customColorset? }
+	//   side    : 'left' | 'right' | 'top' | 'bottom' (entry edge)
+	async rollGroup({ groupId, notation, theme, colorData, side } = {}) {
+		if (!groupId) groupId = `g${Date.now()}_${(this._addCounter++)}`;
+		if (this.groups.has(groupId)) this.removeGroup(groupId); // replace any prior group with this id
+
+		// Resolve this group's look BEFORE touching the factory; awaiting here can't
+		// interleave the synchronous spawn below (see note) so themes never bleed.
+		// Callers may pass a pre-resolved colorData (e.g. an overlay-side cache).
+		if (!colorData) colorData = await this.resolveColorData(theme || this.currentTheme());
+
+		const notationVectors = this.startClickThrow(notation, side);
+		const group = {
+			groupId, notationVectors, colorData, side,
+			meshes: [], state: 'spawning', settled: false, iteration: 0, waiters: [],
+		};
+		this.groups.set(groupId, group);
+
+		const settle = new Promise((resolve) => { group.waiters.push(resolve); });
+
+		if (!notationVectors || notationVectors.error) {
+			group.state = 'settled';
+			const waiters = group.waiters; group.waiters = [];
+			for (const resolve of waiters) { try { resolve(null); } catch (e) {} }
+			return settle;
+		}
+
+		// Apply this group's colorset to the factory, then spawn — materials bake at
+		// creation, so later groups with other themes won't disturb these dice.
+		this.DiceFactory.applyColorSet(colorData);
+		for (let i = 0, len = notationVectors.vectors.length; i < len; ++i) {
+			const before = this.diceList.length;
+			this.spawnDice(notationVectors.vectors[i], false, group);
+			if (this.diceList.length > before) group.meshes.push(this.diceList[this.diceList.length - 1]);
+		}
+
+		// Pre-simulate in isolation to learn the natural landing, reset to the throw
+		// start, then swap faces so forced results land without a settle-time flip.
+		this.simulateGroup(group);
+
+		for (let j = 0; j < group.meshes.length; j++) {
+			this.spawnDice(notationVectors.vectors[j], group.meshes[j], group);
+		}
+
+		if (notationVectors.result && notationVectors.result.length > 0) {
+			for (let j = 0; j < notationVectors.result.length; j++) {
+				const dicemesh = group.meshes[j];
+				if (!dicemesh) continue;
+				if (dicemesh.getLastValue().value == notationVectors.result[j]) continue;
+				this.swapDiceFace(dicemesh, notationVectors.result[j]);
+			}
+		}
+
+		for (const dicemesh of group.meshes) if (dicemesh.body) dicemesh.body.wakeUp();
+
+		group.iteration = 0;
+		group.state = 'animating';
 		this.rolling = true;
-		this.running = Date.now();
-		this.iteration = 0;
-		this.last_time = 0; // fix the animation: starts from the beginning 
-		return new Promise((resolve,reject) => {
-			diceIdArray.forEach(dieId => {
-				const dicemesh = this.diceList[dieId]
-				dicemesh.rerolls += 1;
-				dicemesh.rerolling = true;
-				dicemesh.body.wakeUp();
-				dicemesh.body.type = CANNON.Body.DYNAMIC;
-				dicemesh.body.angularVelocity = new CANNON.Vec3(25, 25, 25);
-				dicemesh.body.velocity = new CANNON.Vec3(0, 0, 3000);
-			})
-			this.animateThrow(this.running, () => {
-				const results = diceIdArray.map(dieId => this.getDiceResults(dieId))
+		this._lastStepTime = 0; // restart the step clock so we don't fast-forward
+		if (!this._continuousRunning) this.start();
 
-				this.onRerollComplete(results)
-				
-				// dispatch an event with the results object for other UI elements to listen for
-				const event = new CustomEvent('rerollComplete', {detail: results})
-				document.dispatchEvent(event)
+		return settle;
+	}
 
-				resolve(results)
-			})
-		})
+	// Remove just one group's dice + record, leaving any other groups in flight.
+	async removeGroup(groupId){
+		const group = this.groups.get(groupId);
+		if (!group) return [];
+		const results = [];
+		for (const mesh of group.meshes) {
+			if (mesh.body) this.world.removeBody(mesh.body);
+			this.scene.remove(mesh);
+			mesh.storeRolledValue('remove');
+			results.push(this.singleDieResult(mesh));
+		}
+		group.state = 'removed';
+		// drop these meshes from the flat list (object refs elsewhere stay valid;
+		// nothing in the group path relies on absolute diceList indices)
+		const gone = new Set(group.meshes);
+		this.diceList = this.diceList.filter((m) => !gone.has(m));
+		this.groups.delete(groupId);
+
+		this.onRemoveDiceComplete(results);
+		document.dispatchEvent(new CustomEvent('removeGroupComplete', { detail: { groupId, results } }));
+		return results;
+	}
+
+	getGroupResults(groupId){
+		const group = this.groups.get(groupId);
+		if (!group) return null;
+		return this.buildResults(group.notationVectors, group.meshes);
+	}
+
+	// --- Back-compat single-roll API, re-implemented on top of groups ---
+
+	async roll(notationSting){
+		this.clearAllGroups();
+		const results = await this.rollGroup({ groupId: '__default__', notation: notationSting, theme: this.currentTheme(), side: this.randomSide() });
+		this.notationVectors = this.groups.get('__default__') ? this.groups.get('__default__').notationVectors : this.notationVectors;
+		this.onRollComplete(results);
+		document.dispatchEvent(new CustomEvent('rollComplete', { detail: results }));
+		return results;
 	}
 
 	async add(notationSting){
-		let dieCount = this.diceList.length
-		if(!dieCount) return this.roll(notationSting)
+		const results = await this.rollGroup({ groupId: `__add__${this._addCounter++}`, notation: notationSting, theme: this.currentTheme(), side: this.randomSide() });
+		this.onAddDiceComplete(results);
+		document.dispatchEvent(new CustomEvent('addDiceComplete', { detail: results }));
+		return results;
+	}
 
-		let addNotationVectors = this.startClickThrow(notationSting)
-		let diceIdArray = []
+	async reroll(diceIdArray){
+		const affected = new Set();
+		diceIdArray.forEach(dieId => {
+			const dicemesh = this.diceList[dieId];
+			if (!dicemesh || !dicemesh.body) return;
+			dicemesh.rerolls += 1;
+			dicemesh.rerolling = true;
+			dicemesh.body.wakeUp();
+			dicemesh.body.type = CANNON.Body.DYNAMIC;
+			dicemesh.body.angularVelocity = new CANNON.Vec3(25, 25, 25);
+			dicemesh.body.velocity = new CANNON.Vec3(0, 0, 3000);
+			if (dicemesh._group) affected.add(dicemesh._group);
+		});
+		affected.forEach(group => { group.state = 'animating'; group.settled = false; group.iteration = 0; });
+		this.rolling = true;
+		this._lastStepTime = 0;
+		if (!this._continuousRunning) this.start();
 
-		for (let i=0, len=addNotationVectors.vectors.length; i < len; ++i) {
-			this.spawnDice(addNotationVectors.vectors[i]);
-		}
-
-		this.simulateThrow();
-		this.steps = 0;
-		this.iteration = 0;
-
-		//reset dice vectors - for just the dice added
-		for (let i=0, len=addNotationVectors.vectors.length; i < len; ++i) {
-			const index = dieCount + i
-			if (!this.diceList[index]) continue;
-
-			//reset dice vectors
-			this.spawnDice(addNotationVectors.vectors[i], this.diceList[index]);
-			diceIdArray.push(index)
-		}
-
-		//check forced results, fix dice faces if necessary
-		if (addNotationVectors.result && addNotationVectors.result.length > 0) {
-			for (let i=0;i<addNotationVectors.result.length;i++) {
-				const index = dieCount + i
-				let dicemesh = this.diceList[index];
-				if (!dicemesh) continue;
-				if (dicemesh.getLastValue().value == addNotationVectors.result[i]) continue;
-				this.swapDiceFace(dicemesh, addNotationVectors.result[i]);
-			}
-		}
-
-		// Wake up newly added dice so they animate before settling
-		// This fixes a bug where throwFinished() returns true immediately
-		// because dice are already in SLEEPING state from simulateThrow()
-		for (const idx of diceIdArray) {
-			const die = this.diceList[idx];
-			if (die && die.body) {
-				die.body.wakeUp();
-			}
-		}
-
-		// let our vectors combine
-		this.notationVectors = DiceNotation.mergeNotation(this.notationVectors, addNotationVectors)
-
-		return new Promise((resolve,reject) => {
-			const callback = () => {
-				const results = diceIdArray.map(dieId => this.getDiceResults(dieId))
-	
-				// setting up a couple of ways to consume the dice added results
-				// call onAddDiceComplete 
-				this.onAddDiceComplete(results)
-	
-				// dispatch an event with the results object for other UI elements to listen for
-				const event = new CustomEvent('addDiceComplete', {detail: results})
-				document.dispatchEvent(event)
-	
-				resolve(results)
-			}
-
-			// animate the previously simulated roll
-			this.rolling = true;
-			this.running = Date.now();
-			this.last_time = 0;
-			this.animateThrow(this.running, callback);
-		})
+		await Promise.all([...affected].map(group => new Promise((resolve) => group.waiters.push(resolve))));
+		const results = diceIdArray.map(dieId => this.getDiceResults(dieId));
+		this.onRerollComplete(results);
+		document.dispatchEvent(new CustomEvent('rerollComplete', { detail: results }));
+		return results;
 	}
 
 	async remove(diceIdArray){
-		
-		return new Promise((resolve,reject) => {
-			const results = []
-			diceIdArray.forEach(dieId => {
-				const mesh = this.diceList[dieId]
-				if (mesh.body) this.world.removeBody(mesh.body);
-				this.scene.remove(mesh);
-				mesh.storeRolledValue('remove');
-				results.push(this.getDiceResults(dieId))
-			})
-
-			this.renderer.render(this.scene, this.camera);
-
-			this.onRemoveDiceComplete(results)
-
-			// dispatch an event with the results object for other UI elements to listen for
-			const event = new CustomEvent('removeDiceComplete', {detail: results})
-			document.dispatchEvent(event)
-
-			resolve(results)
-
-		})
-	}
-
-	rollDice(callback){
-
-		if (this.notationVectors.error) {
-			callback.call(this);
-			return;
-		}
-
-		// this.camera.position.z = this.cameraHeight.far;
-		this.clearDice();
-
-		for (let i=0, len=this.notationVectors.vectors.length; i < len; ++i) {
-			this.spawnDice(this.notationVectors.vectors[i]);
-		}
-		this.simulateThrow();
-		this.steps = 0;
-		this.iteration = 0;
-
-		for (let i=0, len=this.diceList.length; i < len; ++i) {
-			if (!this.diceList[i]) continue;
-			
-			//reset dice vectors
-			this.spawnDice(this.notationVectors.vectors[i],this.diceList[i]);
-		}
-		
-		//check forced results, fix dice faces if necessary
-		if (this.notationVectors.result && this.notationVectors.result.length > 0) {
-			for (let i=0;i<this.notationVectors.result.length;i++) {
-				let dicemesh = this.diceList[i];
-				if (!dicemesh) continue;
-				if (dicemesh.getLastValue().value == this.notationVectors.result[i]) continue;
-				this.swapDiceFace(dicemesh, this.notationVectors.result[i]);
+		const results = [];
+		diceIdArray.forEach(dieId => {
+			const mesh = this.diceList[dieId];
+			if (!mesh) return;
+			if (mesh.body) this.world.removeBody(mesh.body);
+			this.scene.remove(mesh);
+			mesh.storeRolledValue('remove');
+			results.push(this.getDiceResults(dieId));
+			if (mesh._group) {
+				const g = mesh._group;
+				g.meshes = g.meshes.filter((m) => m !== mesh);
 			}
-		}
-
-		// animate the previously simulated roll
-		this.rolling = true;
-		this.running = Date.now();
-		this.last_time = 0;
-		this.animateThrow(this.running, callback);
-
+		});
+		this.render();
+		this.onRemoveDiceComplete(results);
+		document.dispatchEvent(new CustomEvent('removeDiceComplete', { detail: results }));
+		return results;
 	}
 }
 

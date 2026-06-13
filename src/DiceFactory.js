@@ -620,11 +620,10 @@ class DiceFactory {
 
 		// console.log('this.colordata', this.colordata)
 
-		if (this.colordata &&this.colordata.id != prevcolordata.id) {
-			this.applyColorSet(prevcolordata, prevtexture, prevmaterial);
-			// this.applyTexture(prevtexture);
-			// this.applyMaterial(prevmaterial);
-		}
+		// NOTE: the previous "restore prevcolordata if ids differ" branch was removed.
+		// Built-in colorsets have no `id`, so it was inert; for custom colorsets it would
+		// wrongly revert the colorset we just applied. Per-group theming (DiceBox.rollGroup)
+		// relies on applyColorSet() sticking until the group's dice are created.
 	}
 
 	calc_texture_size(approx) {
