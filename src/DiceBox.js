@@ -1142,8 +1142,16 @@ class DiceBox {
 				this.swapDiceFace(dicemesh, addNotationVectors.result[i]);
 			}
 		}
-		
 
+		// Wake up newly added dice so they animate before settling
+		// This fixes a bug where throwFinished() returns true immediately
+		// because dice are already in SLEEPING state from simulateThrow()
+		for (const idx of diceIdArray) {
+			const die = this.diceList[idx];
+			if (die && die.body) {
+				die.body.wakeUp();
+			}
+		}
 
 		// let our vectors combine
 		this.notationVectors = DiceNotation.mergeNotation(this.notationVectors, addNotationVectors)
