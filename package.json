@@ -36,9 +36,10 @@
   ],
   "main": "./dist/dice-box-threejs.es.js",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview"
+    "dev": "node ./node_modules/vite/bin/vite.js",
+    "build": "node ./node_modules/vite/bin/vite.js build",
+    "preview": "node ./node_modules/vite/bin/vite.js preview",
+    "demo": "node ./scripts/demo-server.mjs"
   },
   "devDependencies": {
     "cannon-es-debugger": "^1.0.0",

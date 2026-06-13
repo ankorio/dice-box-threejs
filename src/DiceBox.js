@@ -246,8 +246,11 @@ class DiceBox {
 			const time = Date.now();
 			if (!this._lastStepTime) this._lastStepTime = time - (this.framerate * 1000);
 			let time_diff = (time - this._lastStepTime) / 1000;
-			// clamp after long idle gaps so a freshly-started group doesn't fast-forward
-			if (time_diff > 0.1) time_diff = 0.1;
+			// Step enough to track real time so the sim never crawls when rAF is
+			// throttled (frame drops, an unrendered OBS source). Cap only to avoid a
+			// pathological teleport after a very long stall (rollGroup resets the clock
+			// at throw start, so this isn't hit on a fresh roll).
+			if (time_diff > 0.5) time_diff = 0.5;
 			const neededSteps = Math.max(1, Math.floor(time_diff / this.framerate));
 
 			this.animstate = 'throw';
@@ -271,6 +274,9 @@ class DiceBox {
 				group.iteration += neededSteps;
 				if (this.groupFinished(group)) this.finalizeGroup(group);
 			}
+
+			// dice moved this frame → refresh the (on-demand) shadow map
+			if (this.renderer) this.renderer.shadowMap.needsUpdate = true;
 		} else {
 			// idle: keep the step clock current so the next group starts cleanly
 			this._lastStepTime = Date.now();
@@ -296,7 +302,15 @@ class DiceBox {
 		this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
 		this.container.appendChild(this.renderer.domElement);
 		this.renderer.shadowMap.enabled = this.shadows;
-		this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		// VSM (variance) shadows render a Gaussian-blurred penumbra → smooth, soft,
+		// never stair-stepped (PCF on a spotlight over this big frustum pixelated as
+		// the dice spread out). The softness gives the "faded" contact-shadow look.
+		this.renderer.shadowMap.type = THREE.VSMShadowMap;
+		// The render loop runs every frame (for VFX), but dice shadows only change
+		// while dice move — re-render the (blurred, higher-res) shadow map on demand
+		// instead of every idle frame. We flag it dirty whenever dice move/appear/leave.
+		this.renderer.shadowMap.autoUpdate = false;
+		this.renderer.shadowMap.needsUpdate = true;
 		this.renderer.setClearColor(0x000000, 0);
 
 		this.setDimensions(this.dimensions);
@@ -551,21 +565,28 @@ class DiceBox {
 		this.light.shadow.camera.near = maxwidth / 10;
 		this.light.shadow.camera.far = maxwidth * 5;
 		this.light.shadow.camera.fov = 50;
-		this.light.shadow.bias = 0.001;
-		this.light.shadow.mapSize.width = 1024;
-		this.light.shadow.mapSize.height = 1024;
+		// VSM: bias is near-zero (the blur hides acne); a small radius+blurSamples
+		// gives a soft, smooth penumbra. 2048 keeps the base crisp before the blur,
+		// so shadows read as a clean soft fade rather than a stair-stepped blob.
+		this.light.shadow.bias = -0.0005;
+		this.light.shadow.mapSize.width = 2048;
+		this.light.shadow.mapSize.height = 2048;
+		this.light.shadow.radius = 6;          // VSM Gaussian blur radius (softness)
+		this.light.shadow.blurSamples = 16;
 		this.scene.add(this.light);
+		if (this.renderer) this.renderer.shadowMap.needsUpdate = true; // light rebuilt → refresh
 
 		this.light_amb = new THREE.HemisphereLight( 0xffffbb, 0x676771, this.light_intensity * lightScale );
 		this.scene.add(this.light_amb);
 
 		if (this.desk) this.scene.remove(this.desk);
 		let shadowplane = new THREE.ShadowMaterial();
-		shadowplane.opacity = 0.5;
+		shadowplane.opacity = 0.6; // VSM blur spreads the shadow → a touch more opacity keeps it readable
 		this.desk = new THREE.Mesh(new THREE.PlaneGeometry(this.display.containerWidth * 6, this.display.containerHeight * 6, 1, 1), shadowplane);
 		this.desk.receiveShadow = this.shadows;
 		this.scene.add(this.desk);
 
+		if (this.renderer) this.renderer.shadowMap.needsUpdate = true;
 		this.renderer.render(this.scene, this.camera);
 	}
 
@@ -1060,9 +1081,10 @@ class DiceBox {
 			this.scene.remove(dice);
 			if (dice.body) this.world.removeBody(dice.body);
 		}
+		this.renderer.shadowMap.needsUpdate = true; // dice gone → clear their shadows
 		this.renderer.render(this.scene, this.camera);
 
-		setTimeout(() => { this.renderer.render(this.scene, this.camera); }, 100);
+		setTimeout(() => { this.renderer.shadowMap.needsUpdate = true; this.renderer.render(this.scene, this.camera); }, 100);
 	}
 
 	// Remove every die AND every group record. Used by the legacy roll() path
@@ -1225,6 +1247,7 @@ class DiceBox {
 		const gone = new Set(group.meshes);
 		this.diceList = this.diceList.filter((m) => !gone.has(m));
 		this.groups.delete(groupId);
+		if (this.renderer) this.renderer.shadowMap.needsUpdate = true; // dice gone → clear their shadows
 
 		this.onRemoveDiceComplete(results);
 		document.dispatchEvent(new CustomEvent('removeGroupComplete', { detail: { groupId, results } }));
