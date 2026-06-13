@@ -492,6 +492,9 @@ class DiceFactory {
 		}
 
 		var compositetexture = new THREE.CanvasTexture(canvas);
+		// Albedo/color map authored in sRGB on a 2D canvas: tag it so r152+
+		// ColorManagement converts it correctly. Bump map stays linear (default).
+		compositetexture.colorSpace = THREE.SRGBColorSpace;
 		var bumpMap;
 		if (!isTexture) {
 			bumpMap = new THREE.CanvasTexture(canvasBump);
