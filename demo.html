@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>dice-box-threejs r182 verify</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #2b2b2b; color: #eee; font-family: system-ui, sans-serif; }
+    #container { width: 100vw; height: 80vh; }
+    #bar { padding: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+    button { padding: 6px 10px; cursor: pointer; }
+    #status { margin-left: 12px; font-size: 13px; opacity: 0.8; }
+  </style>
+</head>
+<body>
+  <div id="bar">
+    <button data-roll="4d6">roll 4d6</button>
+    <button data-roll="2d20">roll 2d20</button>
+    <button data-theme="white">white</button>
+    <button data-theme="fire">fire</button>
+    <button data-theme="ice">ice</button>
+    <button data-theme="radiant">radiant</button>
+    <button data-theme="bronze">bronze</button>
+    <button id="trailsBtn">trails: on</button>
+    <span id="status">loading…</span>
+  </div>
+  <div id="container"></div>
+
+  <!-- Single shared three instance (r182). The externalized dist resolves
+       its bare `import ... from "three"` through this map. -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/node_modules/three/build/three.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    window.THREE_REVISION = THREE.REVISION;
+    import DiceBox from './dist/dice-box-threejs.es.js';
+
+    const status = document.getElementById('status');
+    const Box = new DiceBox('#container', {
+      assetPath: '/public/',
+      theme_colorset: 'white',
+      theme_texture: 'cloudy',
+      theme_material: 'glass',
+      light_intensity: 0.7,
+      gravity_multiplier: 400,
+      baseScale: 100,
+      shadows: true,
+      continuousRender: true, // Phase 3: keep drawing while dice are idle
+    });
+    window.Box = Box; // for console poking
+
+    try {
+      await Box.initialize();
+      status.textContent = `ready · three r${window.THREE_REVISION ?? '?'}`;
+
+      // ---- VFX hook demo: a glowing motion trail left by each die while it
+      // rolls. Everything below uses the APP's three instance and lives in the
+      // dice scene — emitted/updated per-frame from Box.onBeforeRender(dt) and
+      // drawn by Box's own renderer/camera. This is the depth-sorted, additive,
+      // shared-canvas particle path that Phase 4 builds on for real.
+
+      // soft radial glow sprite texture
+      function makeGlowTexture() {
+        const c = document.createElement('canvas');
+        c.width = c.height = 64;
+        const g = c.getContext('2d');
+        const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+        grd.addColorStop(0.0, 'rgba(255,255,255,1)');
+        grd.addColorStop(0.3, 'rgba(255,255,255,0.55)');
+        grd.addColorStop(1.0, 'rgba(255,255,255,0)');
+        g.fillStyle = grd;
+        g.fillRect(0, 0, 64, 64);
+        const t = new THREE.CanvasTexture(c);
+        t.colorSpace = THREE.SRGBColorSpace;
+        return t;
+      }
+      const glowTex = makeGlowTexture();
+
+      const LIFE = 0.5;            // seconds each puff lives
+      const trail = [];           // active sprites
+      const dieHue = new Map();   // stable color per die
+      let trailsOn = true;
+
+      function colorForDie(die, i) {
+        if (!dieHue.has(die)) {
+          dieHue.set(die, new THREE.Color().setHSL((i * 0.13) % 1, 0.95, 0.6));
+        }
+        return dieHue.get(die);
+      }
+
+      function emit(pos, color, size) {
+        const mat = new THREE.SpriteMaterial({
+          map: glowTex,
+          color,
+          transparent: true,
+          depthTest: true,      // sort against the dice…
+          depthWrite: false,    // …but don't occlude later puffs
+          blending: THREE.AdditiveBlending,
+        });
+        const s = new THREE.Sprite(mat);
+        s.position.copy(pos);
+        s.scale.setScalar(size);
+        s.userData.life = LIFE;
+        s.userData.size = size;
+        Box.scene.add(s);
+        trail.push(s);
+      }
+
+      let frames = 0, acc = 0;
+      Box.onBeforeRender((dt) => {
+        // emit from each die only while the throw is animating
+        if (trailsOn && Box.rolling) {
+          for (let i = 0; i < Box.diceList.length; i++) {
+            const die = Box.diceList[i];
+            if (!die.geometry.boundingSphere) die.geometry.computeBoundingSphere();
+            const r = die.geometry.boundingSphere.radius * (die.scale ? die.scale.x : 1);
+            emit(die.position, colorForDie(die, i), r * 1.9);
+          }
+        }
+        // age + fade every puff (keeps running via the continuous loop after settle)
+        for (let k = trail.length - 1; k >= 0; k--) {
+          const s = trail[k];
+          s.userData.life -= dt;
+          if (s.userData.life <= 0) {
+            Box.scene.remove(s);
+            s.material.dispose();
+            trail.splice(k, 1);
+            continue;
+          }
+          const f = s.userData.life / LIFE;
+          s.material.opacity = f;
+          s.scale.setScalar(s.userData.size * (0.35 + 0.65 * f));
+        }
+
+        frames++; acc += dt;
+        if (acc >= 0.5) {
+          status.textContent =
+            `three r${window.THREE_REVISION} · ${(frames / acc).toFixed(0)} fps · puffs=${trail.length}`;
+          frames = 0; acc = 0;
+        }
+      });
+
+      document.getElementById('trailsBtn').addEventListener('click', (e) => {
+        trailsOn = !trailsOn;
+        e.target.textContent = 'trails: ' + (trailsOn ? 'on' : 'off');
+      });
+
+      await Box.roll('4d6');
+    } catch (e) {
+      status.textContent = 'init error: ' + e.message;
+      console.error(e);
+    }
+
+    document.querySelectorAll('[data-roll]').forEach(b =>
+      b.addEventListener('click', () => Box.roll(b.dataset.roll)));
+
+    document.querySelectorAll('[data-theme]').forEach(b =>
+      b.addEventListener('click', async () => {
+        await Box.updateConfig({ theme_colorset: b.dataset.theme });
+        Box.roll('4d6');
+        status.textContent = 'theme: ' + b.dataset.theme;
+      }));
+  </script>
+</body>
+</html>
