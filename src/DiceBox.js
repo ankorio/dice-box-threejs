@@ -501,7 +501,12 @@ class DiceBox {
 			this.theme_material = options.theme_material
 		}
 		if(options.theme_colorset || options.theme_texture || options.theme_material || options.theme_customColorset){
-			await this.loadTheme({
+			// A custom colorset wins: it carries its own foreground/background/edge (plus
+			// texture+material). Passing only colorset/texture/material here dropped it, so
+			// updateConfig() re-themed material+texture but never the custom colours.
+			await this.loadTheme(this.theme_customColorset ? {
+				customColorset: this.theme_customColorset
+			} : {
 				colorset: this.theme_colorset,
 				texture: this.theme_texture,
 				material: this.theme_material
