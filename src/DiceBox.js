@@ -1000,6 +1000,17 @@ class DiceBox {
 				//check for forced roll
 				if (dicemesh.result.length == 0) {
 					dicemesh.storeRolledValue(dicemesh.resultReason);
+					// Backstop: if this die had a forced target but settled on the wrong
+					// face (a cross-group collision the prediction missed, or the cap was
+					// hit), relabel it AT REST so the up-face shows the forced value. With
+					// the shared-world prediction this should essentially never fire; it
+					// guarantees a correct number (at the cost of a one-frame flip) when it
+					// does. Forced targets are parallel to group.meshes (same as the throw).
+					const forced = group.notationVectors && group.notationVectors.result && group.notationVectors.result[i];
+					if (forced != null && dicemesh.getLastValue().value != forced) {
+						this.swapDiceFace(dicemesh, forced);
+						dicemesh.storeRolledValue('forced');
+					}
 					rethrow = this.checkForRethrow(dicemesh);
 				} else if (dicemesh.result.length > 0 && dicemesh.rerolling) {
 					dicemesh.rerolling = false;
@@ -1024,31 +1035,118 @@ class DiceBox {
 		return true;
 	}
 
-	// Pre-simulate one group to its resting position so forced results can be
-	// face-swapped BEFORE the visible throw (avoiding any settle-time "number flip").
-	// Other groups' bodies are lifted out of the world for the duration so this
-	// blocking sim can't fast-forward dice that are still in flight; their state is
-	// untouched and they're added straight back.
-	simulateGroup(group) {
+	// Capture the whole physics world so a blocking prediction can run and be rolled
+	// back without disturbing the live animation. With a fixed dt cannon-es clears
+	// forces each step, so only these per-body fields (+ world.time, which drives sleep
+	// timing) are needed for an exact replay — validated bit-exact for the mid-flight
+	// snapshot/restore case in scripts/determinism-spike.mjs.
+	snapshotWorld() {
+		return {
+			time: this.world.time,
+			stepnumber: this.world.stepnumber,
+			bodies: this.world.bodies.map((b) => ({
+				body: b,
+				position: b.position.clone(),
+				quaternion: b.quaternion.clone(),
+				velocity: b.velocity.clone(),
+				angularVelocity: b.angularVelocity.clone(),
+				sleepState: b.sleepState,
+				timeLastSleepy: b.timeLastSleepy,
+				type: b.type,
+			})),
+		};
+	}
+
+	restoreWorld(snap) {
+		this.world.time = snap.time;
+		this.world.stepnumber = snap.stepnumber;
+		for (const s of snap.bodies) {
+			const b = s.body;
+			b.position.copy(s.position);
+			b.quaternion.copy(s.quaternion);
+			b.velocity.copy(s.velocity);
+			b.angularVelocity.copy(s.angularVelocity);
+			b.previousPosition.copy(s.position);
+			b.interpolatedPosition.copy(s.position);
+			b.interpolatedQuaternion.copy(s.quaternion);
+			b.force.setZero();
+			b.torque.setZero();
+			b.vlambda.setZero();
+			b.wlambda.setZero();
+			b.sleepState = s.sleepState;
+			b.timeLastSleepy = s.timeLastSleepy;
+			b.type = s.type;
+			b.aabbNeedsUpdate = true;
+		}
+	}
+
+	// Re-predict the SHARED world and relabel every in-flight forced die so its forced
+	// value lands up — accounting for collisions between concurrent groups. Called on
+	// each new throw (rollback-style): snapshot → fast-forward all in-flight dice to rest
+	// (with collisions, mirroring the live loop's freeze-on-sleep) → relabel from the
+	// predicted resting orientation → restore. Because the live loop replays the same
+	// fixed-dt steps from the restored state, what's shown reproduces this prediction
+	// until the next throw re-runs it. Replaces the old per-group, collision-blind sim;
+	// groupFinished() carries a guaranteed at-rest backstop for the residual cases.
+	predictAndRelabelAll() {
+		const SLEEPING = CANNON.Body.SLEEPING, KINEMATIC = CANNON.Body.KINEMATIC;
+
+		// All still-moving dice across every animating group take part in the prediction
+		// (forced or not — they all collide); only those with a forced target get relabeled.
+		// Dice already settled (slept → KINEMATIC) are immovable obstacles, left untouched.
+		const physics = [];                 // every DYNAMIC die in an unsettled group
+		const relabel = [];                 // { mesh, target } subset that has a forced value
+		for (const group of this.groups.values()) {
+			if (group.state !== 'animating' && group.state !== 'spawning') continue;
+			const targets = (group.notationVectors && group.notationVectors.result) || null;
+			for (let i = 0; i < group.meshes.length; i++) {
+				const mesh = group.meshes[i];
+				if (!mesh || !mesh.body) continue;
+				if (mesh.body.type === KINEMATIC) continue;     // already-settled obstacle
+				physics.push(mesh);
+				if (targets && targets[i] != null) relabel.push({ mesh, target: targets[i] });
+			}
+		}
+		if (!relabel.length) return;
+
 		const prevAnimstate = this.animstate;
 		this.animstate = 'simulate';
+		const snap = this.snapshotWorld();
 
-		const removed = [];
-		for (let i = 0, len = this.diceList.length; i < len; ++i) {
-			const mesh = this.diceList[i];
-			if (!mesh || !mesh.body) continue;
-			if (mesh._group === group) continue;
-			this.world.removeBody(mesh.body);
-			removed.push(mesh.body);
+		// Reset each forced die to its pristine (un-swapped) labeling so re-prediction is
+		// idempotent: getFaceValue() reads base labels and swapDiceFace() applies one swap.
+		// (swapDiceFace always clones, so DiceFactory.geometries[type] stays pristine.)
+		for (const { mesh } of relabel) {
+			const pristine = this.DiceFactory.geometries[mesh.notation.type];
+			if (pristine) mesh.geometry = pristine;
+			mesh.result = [];
 		}
 
-		group.iteration = 0;
-		while (!this.groupFinished(group)) {
-			++group.iteration;
+		// Fast-forward the whole world to rest. Freeze each die KINEMATIC the moment it
+		// sleeps, exactly as the live loop (groupFinished) does, so collisions with
+		// already-rested dice match what will actually be shown.
+		let iter = 0;
+		const cap = this.iterationLimit || 1000;
+		const allRested = () => {
+			for (const m of physics) if (m.body.type !== KINEMATIC && m.body.sleepState !== SLEEPING) return false;
+			return true;
+		};
+		while (iter++ < cap && !allRested()) {
 			this.world.step(this.framerate);
+			for (const m of physics) if (m.body.sleepState === SLEEPING && m.body.type !== KINEMATIC) m.body.type = KINEMATIC;
 		}
 
-		for (let i = 0; i < removed.length; i++) this.world.addBody(removed[i]);
+		// Relabel each forced die from its predicted resting orientation.
+		for (const { mesh, target } of relabel) {
+			const natural = mesh.getFaceValue();
+			if (natural && natural.value != target) {
+				mesh.result = [natural];        // swapDiceFace reads getLastValue()
+				this.swapDiceFace(mesh, target);
+			}
+			mesh.result = [];
+		}
+
+		this.restoreWorld(snap);
 		this.animstate = prevAnimstate;
 	}
 
@@ -1207,22 +1305,12 @@ class DiceBox {
 			if (this.diceList.length > before) group.meshes.push(this.diceList[this.diceList.length - 1]);
 		}
 
-		// Pre-simulate in isolation to learn the natural landing, reset to the throw
-		// start, then swap faces so forced results land without a settle-time flip.
-		this.simulateGroup(group);
-
-		for (let j = 0; j < group.meshes.length; j++) {
-			this.spawnDice(notationVectors.vectors[j], group.meshes[j], group);
-		}
-
-		if (notationVectors.result && notationVectors.result.length > 0) {
-			for (let j = 0; j < notationVectors.result.length; j++) {
-				const dicemesh = group.meshes[j];
-				if (!dicemesh) continue;
-				if (dicemesh.getLastValue().value == notationVectors.result[j]) continue;
-				this.swapDiceFace(dicemesh, notationVectors.result[j]);
-			}
-		}
+		// Shared-world prediction: with this group spawned, re-predict the WHOLE box (all
+		// in-flight groups together, cross-group collisions included) and relabel every
+		// forced die so its value lands up despite bounces. Snapshot/restore leaves the
+		// live animation untouched; deterministic replay means what's shown reproduces
+		// this prediction until the next throw re-runs it. See predictAndRelabelAll().
+		this.predictAndRelabelAll();
 
 		for (const dicemesh of group.meshes) if (dicemesh.body) dicemesh.body.wakeUp();
 
